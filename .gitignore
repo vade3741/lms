@@ -1,0 +1,27 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+
+# Database & Vector Store Data
+app/database/*.db
+app/rag/chroma_db/
+
+# Recorded Audio Files & Temporary Uploads
+app/speech/audio/*.wav
+*.wav
+*.mp3
+
+# Environment & Secrets
+.env
+.env.local
+
+# IDE & OS Specific
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

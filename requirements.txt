@@ -1,0 +1,11 @@
+streamlit
+requests
+pandas
+pymupdf
+chromadb
+numpy
+faster-whisper
+streamlit-audiorecorder
+pydub
+reportlab
+matplotlib
