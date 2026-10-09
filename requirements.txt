@@ -9,3 +9,5 @@ streamlit-audiorecorder
 pydub
 reportlab
 matplotlib
+ddgs
+trafilatura

@@ -10,6 +10,8 @@ ENV/
 # Database & Vector Store Data
 app/database/*.db
 app/rag/chroma_db/
+/pdf/*.pdf
+.pytest_cache/
 
 # Recorded Audio Files & Temporary Uploads
 app/speech/audio/*.wav

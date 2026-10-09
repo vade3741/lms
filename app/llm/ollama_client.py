@@ -1,15 +1,58 @@
 import requests
 
+from app.config import get_settings
 
-OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 
-MODEL_NAME = "gemma2:2b"
-MODEL_GUIDANCE = "Try gemma2:2b for speed, or qwen2.5-coder:3b if you need stronger coding output."
+def check_ollama_status(timeout=5):
+    settings = get_settings()
+    status = {
+        "service_available": False,
+        "chat_model": settings.chat_model,
+        "chat_model_available": False,
+        "embedding_model": settings.embedding_model,
+        "embedding_model_available": False,
+        "error": ""
+    }
+
+    try:
+        response = requests.get(
+            f"{settings.ollama_base_url}/api/tags",
+            timeout=timeout
+        )
+        response.raise_for_status()
+        models = response.json().get("models", [])
+    except requests.exceptions.ConnectionError:
+        status["error"] = (
+            "Ollama is not running. Start the Ollama app or run `ollama serve`."
+        )
+        return status
+    except requests.exceptions.Timeout:
+        status["error"] = "Ollama did not respond before the status-check timeout."
+        return status
+    except requests.exceptions.RequestException as error:
+        status["error"] = f"Could not check Ollama: {error}"
+        return status
+    except ValueError:
+        status["error"] = "Ollama returned an invalid model-list response."
+        return status
+
+    installed_models = {
+        model_name
+        for model in models
+        if (model_name := model.get("name") or model.get("model"))
+    }
+    status["service_available"] = True
+    status["chat_model_available"] = settings.chat_model in installed_models
+    status["embedding_model_available"] = (
+        settings.embedding_model in installed_models
+    )
+    return status
 
 
 def ask_ollama(prompt):
+    settings = get_settings()
     payload = {
-        "model": MODEL_NAME,
+        "model": settings.chat_model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
@@ -23,9 +66,9 @@ def ask_ollama(prompt):
 
     try:
         response = requests.post(
-            OLLAMA_GENERATE_URL,
+            f"{settings.ollama_base_url}/api/generate",
             json=payload,
-            timeout=180
+            timeout=settings.ollama_timeout_seconds
         )
         response.raise_for_status()
         data = response.json()
@@ -33,12 +76,15 @@ def ask_ollama(prompt):
         return data.get("response", "No response received from Ollama.")
 
     except requests.exceptions.ConnectionError:
-        return f"Error: Ollama is not running. Run: ollama run {MODEL_NAME}. {MODEL_GUIDANCE}"
+        return (
+            f"Error: Ollama is not running. Start it and ensure "
+            f"'{settings.chat_model}' is installed."
+        )
 
     except requests.exceptions.Timeout:
         return (
-            f"Error: Ollama timed out while using {MODEL_NAME}. "
-            f"Try a shorter prompt, wait for the model to warm up, or switch models. {MODEL_GUIDANCE}"
+            f"Error: Ollama timed out while using {settings.chat_model}. "
+            "Try a shorter prompt or wait for the model to warm up."
         )
 
     except Exception as e:

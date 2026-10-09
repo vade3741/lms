@@ -17,9 +17,22 @@ from app.analytics.weak_area_tracker import (
 from app.agents.report_agent import generate_report_pdf, generate_full_report_pdf_agent
 from app.speech.transcriber import save_audio_file, transcribe_audio
 from app.nlp.scoring import calculate_hybrid_score
-from app.rag.rag_engine import build_rag_index, retrieve_context
-from app.database.db import init_db, save_interview, get_interviews
-from app.llm.ollama_client import ask_ollama
+from app.config import get_settings
+from app.rag.rag_engine import (
+    PDF_DIRECTORY,
+    build_rag_index,
+    retrieve_context,
+    retrieve_study_context
+)
+from app.database.db import (
+    get_practice_history,
+    get_study_documents,
+    get_study_notes,
+    get_interviews,
+    init_db,
+    save_interview
+)
+from app.llm.ollama_client import ask_ollama, check_ollama_status
 from app.agents.orchestrator import (
     get_question_prompt_by_round,
     get_evaluation_prompt_by_round
@@ -28,6 +41,20 @@ from app.utils.json_utils import extract_json, get_questions_from_response
 from app.utils.file_reader import extract_text_from_file
 from app.execution.code_runner import run_python_code
 from app.speech.tts import render_tts_button, text_to_speech_bytes
+from app.study_workflow import (
+    add_pdf_files,
+    add_manual_question,
+    evaluate_study_answer,
+    generate_pdf_notes,
+    generate_pdf_questions,
+    generate_web_questions,
+    get_question_bank,
+    get_saved_web_sources,
+    import_web_source,
+    remove_pdf,
+    search_public_questions,
+    sync_pdf_library
+)
 
 
 init_db()
@@ -77,11 +104,52 @@ if "full_interview_results" not in st.session_state:
 if "interview_started" not in st.session_state:
     st.session_state.interview_started = False
 
-tab1, tab2, tab3, tab4 = st.tabs([
+with st.sidebar:
+    st.header("Local AI setup")
+    if (
+        "ollama_status" not in st.session_state
+        or st.button("Refresh Ollama model status")
+    ):
+        st.session_state.ollama_status = check_ollama_status()
+
+    ollama_status = st.session_state.ollama_status
+    if not ollama_status["service_available"]:
+        st.error(ollama_status["error"])
+    else:
+        chat_label = (
+            "available" if ollama_status["chat_model_available"] else "missing"
+        )
+        embedding_label = (
+            "available"
+            if ollama_status["embedding_model_available"]
+            else "missing"
+        )
+        st.write(
+            f"Chat model `{ollama_status['chat_model']}`: **{chat_label}**"
+        )
+        st.write(
+            f"Embedding model `{ollama_status['embedding_model']}`: "
+            f"**{embedding_label}**"
+        )
+        if not (
+            ollama_status["chat_model_available"]
+            and ollama_status["embedding_model_available"]
+        ):
+            settings = get_settings()
+            missing_models = []
+            if not ollama_status["chat_model_available"]:
+                missing_models.append(settings.chat_model)
+            if not ollama_status["embedding_model_available"]:
+                missing_models.append(settings.embedding_model)
+            st.caption("Install a missing model with:")
+            st.code("\n".join(f"ollama pull {model}" for model in missing_models))
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Start Interview",
     "Interview History",
     "Dashboard",
-    "Learning Plan"
+    "Learning Plan",
+    "Study & Revision"
 ])
 
 
@@ -836,3 +904,471 @@ with tab4:
                     st.write(item["final_suggestion"])
         else:
             st.success("No low-score questions found. Good progress!")
+
+
+with tab5:
+    st.header("Study & Revision")
+    st.caption(
+        f"PDFs, saved questions, notes, answers, and review history stay in "
+        f"`{PDF_DIRECTORY}` and your local SQLite/Chroma data. PDF-grounded "
+        "generation and feedback use your local Ollama models."
+    )
+
+    study_sections = st.tabs([
+        "PDF library & notes",
+        "Practice & due review",
+        "Public question research",
+        "Progress & history"
+    ])
+
+    with study_sections[0]:
+        uploaded_pdfs = st.file_uploader(
+            "Add text-based PDFs to your local study library",
+            type=["pdf"],
+            accept_multiple_files=True,
+            max_upload_size=50,
+            key="study_pdf_upload"
+        )
+        if st.button("Save and index uploaded PDFs", key="upload_study_pdfs"):
+            if not uploaded_pdfs:
+                st.warning("Choose one or more PDF files first.")
+            else:
+                try:
+                    with st.spinner("Saving and indexing PDFs locally..."):
+                        upload_result = add_pdf_files(uploaded_pdfs)
+                    st.success(
+                        f"Added {len(upload_result['uploaded'])} PDF(s); "
+                        f"{len(upload_result['duplicates'])} duplicate(s) already existed."
+                    )
+                    for message in upload_result["errors"]:
+                        st.warning(message)
+                except Exception as error:
+                    st.error(f"Could not add PDFs: {error}")
+
+        first_sync = "study_workflow_synced" not in st.session_state
+        if first_sync or st.button("Sync PDF folder", key="sync_study_pdfs"):
+            try:
+                with st.spinner("Syncing the PDF study folder..."):
+                    sync_result = sync_pdf_library()
+                st.session_state.study_sync_result = sync_result
+                st.session_state.study_workflow_synced = True
+                st.session_state.pop("study_sync_error", None)
+            except Exception as error:
+                st.session_state.study_sync_error = str(error)
+                st.session_state.study_workflow_synced = True
+
+        if st.session_state.get("study_sync_error"):
+            st.error(f"Could not sync the PDF library: {st.session_state.study_sync_error}")
+            if st.button("Retry PDF sync", key="retry_study_pdfs"):
+                st.session_state.pop("study_sync_error", None)
+                st.session_state.pop("study_workflow_synced", None)
+                st.rerun()
+
+        sync_result = st.session_state.get("study_sync_result")
+        if sync_result:
+            if sync_result["indexed"] or sync_result["removed"]:
+                st.success(
+                    f"PDF library synced: {sync_result['indexed']} indexed, "
+                    f"{sync_result['unchanged']} unchanged, "
+                    f"{sync_result['removed']} removed."
+                )
+            for message in sync_result["errors"]:
+                st.warning(message)
+
+        documents = get_study_documents()
+        if documents:
+            st.subheader("Your PDF library")
+            for document in documents:
+                status = document["status"]
+                label = (
+                    f"{document['filename']} — {document['page_count']} pages "
+                    f"— {status}"
+                )
+                with st.expander(label):
+                    st.caption(document["file_path"])
+                    if document["error"]:
+                        st.warning(document["error"])
+                    st.caption(
+                        "Removing a PDF also removes questions and practice "
+                        "history tied to that document."
+                    )
+                    confirm_key = f"confirm_remove_pdf_{document['id']}"
+                    confirmed = st.checkbox(
+                        "Confirm removal",
+                        key=confirm_key
+                    )
+                    if st.button(
+                        "Remove PDF and related study data",
+                        key=f"remove_pdf_{document['id']}",
+                        disabled=not confirmed
+                    ):
+                        try:
+                            remove_pdf(document["id"])
+                            st.success(f"Removed {document['filename']}.")
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"Could not remove the PDF: {error}")
+        else:
+            st.info("No PDFs yet. Upload files here or add them to the `pdf/` folder.")
+
+        indexed_documents = [
+            item for item in documents if item["status"] == "indexed"
+        ]
+        if indexed_documents:
+            pdf_names = {
+                item["file_path"]: item["filename"]
+                for item in indexed_documents
+            }
+            selected_paths = st.multiselect(
+                "Limit study to selected PDFs (leave empty to search all)",
+                options=list(pdf_names),
+                format_func=lambda path: pdf_names[path],
+                key="study_pdf_selection"
+            )
+            study_query = st.text_input(
+                "Topic to revise",
+                placeholder="For example: Kafka consumer groups and rebalancing",
+                key="study_query"
+            )
+            notes_column, questions_column = st.columns(2)
+            with notes_column:
+                if st.button("Create and save short notes", key="generate_pdf_notes"):
+                    if not study_query.strip():
+                        st.warning("Enter a topic first.")
+                    else:
+                        try:
+                            with st.spinner("Writing cited notes with local Ollama..."):
+                                generated_note = generate_pdf_notes(
+                                    study_query,
+                                    file_paths=selected_paths or None
+                                )
+                            st.session_state.latest_study_note = generated_note
+                        except Exception as error:
+                            st.error(f"Could not create notes: {error}")
+            with questions_column:
+                question_count = st.number_input(
+                    "Questions to generate",
+                    min_value=1,
+                    max_value=8,
+                    value=5,
+                    key="pdf_question_count"
+                )
+                if st.button("Generate grounded questions", key="generate_pdf_questions"):
+                    if not study_query.strip():
+                        st.warning("Enter a topic first.")
+                    else:
+                        try:
+                            with st.spinner("Generating PDF-grounded questions..."):
+                                created_questions = generate_pdf_questions(
+                                    study_query,
+                                    file_paths=selected_paths or None,
+                                    count=question_count
+                                )
+                            st.success(
+                                f"Saved {len(created_questions)} questions to your local bank."
+                            )
+                        except Exception as error:
+                            st.error(f"Could not generate questions: {error}")
+
+            if st.session_state.get("latest_study_note"):
+                note = st.session_state.latest_study_note
+                st.subheader(note["topic"])
+                st.markdown(note["note_text"])
+                st.markdown("**Sources**")
+                for source in note["source_evidence"]:
+                    st.write(f"- {source['citation']}")
+
+            if study_query.strip() and st.button(
+                "Find relevant PDF passages",
+                key="find_study_passages"
+            ):
+                try:
+                    passages = retrieve_study_context(
+                        study_query,
+                        top_k=5,
+                        file_paths=selected_paths or None
+                    )
+                    if passages:
+                        st.session_state.study_context = passages
+                    else:
+                        st.info("No matching passages found in the selected PDFs.")
+                except Exception as error:
+                    st.error(f"Could not search the PDF library: {error}")
+            if st.session_state.get("study_context"):
+                st.subheader("Relevant passages")
+                st.markdown(st.session_state.study_context)
+
+        st.subheader("Saved revision notes")
+        for note in get_study_notes(limit=10):
+            with st.expander(f"{note['topic']} — {note['created_at']}"):
+                st.markdown(note["note_text"])
+                citations = [
+                    item["citation"] for item in note["source_evidence"]
+                ]
+                if citations:
+                    st.caption("Sources: " + "; ".join(citations))
+
+    with study_sections[1]:
+        st.subheader("One question at a time")
+        due_only = st.checkbox("Show due questions only", value=True)
+        questions = get_question_bank(due_only=due_only)
+        if not questions and due_only:
+            st.success("Nothing is due. Turn off the filter to practise any saved question.")
+        elif not questions:
+            st.info("Generate questions from PDFs or save questions from an imported source.")
+        else:
+            question_labels = {
+                item["id"]: (
+                    f"{item['topic']} · {item['difficulty']} · "
+                    f"{item['question'][:95]}"
+                )
+                for item in questions
+            }
+            selected_question_id = st.selectbox(
+                "Choose a saved question",
+                options=list(question_labels),
+                format_func=lambda question_id: question_labels[question_id],
+                key="practice_question_id"
+            )
+            question = next(
+                item for item in questions if item["id"] == selected_question_id
+            )
+            st.info(question["question"])
+            st.caption(
+                f"Topic: {question['topic']} · Difficulty: {question['difficulty']} "
+                f"· Last score: {question['last_score'] if question['last_score'] is not None else 'not attempted'} "
+                f"· Attempts: {question['attempt_count']}"
+            )
+            if question["provenance"] == "pdf":
+                st.caption(
+                    f"Grounded in {question['filename'] or 'saved PDF'}, "
+                    f"page {question['page_number'] or '?'}"
+                )
+            elif question["provenance"] == "web":
+                st.caption(
+                    f"Web source: {question['source_title']} "
+                    f"({question['source_url']})"
+                )
+            else:
+                st.caption("Personal question with a saved offline reference answer.")
+            with st.form(f"study_answer_form_{selected_question_id}"):
+                submitted_answer = st.text_area(
+                    "Your answer",
+                    height=160,
+                    placeholder="Answer from memory before revealing the sample answer...",
+                    key=f"study_answer_{selected_question_id}"
+                )
+                submit_answer = st.form_submit_button("Submit and get feedback")
+            if submit_answer:
+                try:
+                    with st.spinner("Checking your answer against saved evidence..."):
+                        feedback = evaluate_study_answer(question, submitted_answer)
+                    st.session_state[f"study_feedback_{selected_question_id}"] = feedback
+                except Exception as error:
+                    st.error(f"Could not evaluate the answer: {error}")
+
+            feedback = st.session_state.get(
+                f"study_feedback_{selected_question_id}"
+            )
+            if feedback:
+                st.metric("Evidence-based score", f"{feedback['score']}/100")
+                st.write(feedback["feedback"])
+                if feedback["strengths"]:
+                    st.markdown("**What you covered well**")
+                    for item in feedback["strengths"]:
+                        st.write(f"- {item}")
+                if feedback["missing_concepts"]:
+                    st.markdown("**Concepts to revisit**")
+                    for item in feedback["missing_concepts"]:
+                        st.write(f"- {item}")
+                if feedback["unsupported_claims"]:
+                    st.markdown("**Claims not supported by the saved source**")
+                    for item in feedback["unsupported_claims"]:
+                        st.write(f"- {item}")
+                if feedback["next_step"]:
+                    st.write(f"**Next step:** {feedback['next_step']}")
+                st.caption(
+                    "Next review: " + feedback["next_review_at"]
+                )
+                st.markdown("**Evidence used**")
+                for item in feedback["source_evidence"]:
+                    st.write(f"- {item['citation']}")
+                if st.checkbox(
+                    "Reveal saved sample answer",
+                    key=f"reveal_sample_{selected_question_id}"
+                ):
+                    st.markdown(question["sample_answer"] or "No sample answer was saved.")
+                if question["hint"]:
+                    with st.expander("Show hint"):
+                        st.write(question["hint"])
+
+    with study_sections[2]:
+        st.subheader("Optional free public-source search")
+        st.caption(
+            "Search is online and may be unavailable. Import only sources you "
+            "want to keep; saved excerpts and questions are then available offline."
+        )
+        with st.expander("Add a personal question"):
+            with st.form("add_manual_study_question"):
+                manual_topic = st.text_input("Topic", key="manual_question_topic")
+                manual_question_text = st.text_area(
+                    "Interview question",
+                    key="manual_question_text"
+                )
+                manual_reference = st.text_area(
+                    "Reference answer (used for grounded feedback)",
+                    key="manual_question_reference"
+                )
+                manual_concepts = st.text_input(
+                    "Expected concepts (comma-separated)",
+                    key="manual_question_concepts"
+                )
+                manual_hint = st.text_input(
+                    "Optional hint",
+                    key="manual_question_hint"
+                )
+                save_manual_question = st.form_submit_button("Save personal question")
+            if save_manual_question:
+                try:
+                    add_manual_question(
+                        manual_question_text,
+                        manual_topic,
+                        manual_reference,
+                        expected_concepts=[
+                            concept.strip()
+                            for concept in manual_concepts.split(",")
+                            if concept.strip()
+                        ],
+                        hint=manual_hint
+                    )
+                    st.success("Saved to your local question bank.")
+                except Exception as error:
+                    st.error(f"Could not save the question: {error}")
+
+        web_query = st.text_input(
+            "Search public interview material",
+            placeholder="For example: Kafka producer idempotence interview questions",
+            key="web_question_query"
+        )
+        if st.button("Search the web", key="search_public_questions"):
+            try:
+                with st.spinner("Searching public sources..."):
+                    st.session_state.public_question_results = search_public_questions(
+                        web_query,
+                        max_results=5
+                    )
+            except Exception as error:
+                st.error(str(error))
+        for index, result in enumerate(
+            st.session_state.get("public_question_results", [])
+        ):
+            with st.container(border=True):
+                st.markdown(f"**{result['title']}**")
+                st.caption(result["publisher"])
+                st.write(result["snippet"])
+                st.link_button("Open source", result["url"])
+                if st.button(
+                    "Import excerpt for offline practice",
+                    key=f"import_web_source_{index}"
+                ):
+                    try:
+                        with st.spinner("Saving a readable excerpt locally..."):
+                            imported = import_web_source(
+                                result["url"],
+                                title=result["title"],
+                                publisher=result["publisher"],
+                                search_snippet=result["snippet"]
+                            )
+                        if (
+                            imported["metadata"].get("extraction_mode")
+                            == "search_result_snippet"
+                        ):
+                            st.warning(
+                                f"The source host blocked article access. Saved "
+                                f"the search-result snippet for {imported['title']} "
+                                f"instead; it contains less context than the full article."
+                            )
+                        else:
+                            st.success(f"Saved source: {imported['title']}")
+                    except Exception as error:
+                        st.error(f"Could not import this source: {error}")
+
+        st.subheader("Saved web sources")
+        saved_sources = get_saved_web_sources()
+        if saved_sources:
+            source_labels = {
+                source["id"]: source["title"] for source in saved_sources
+            }
+            selected_source_id = st.selectbox(
+                "Choose an imported source",
+                options=list(source_labels),
+                format_func=lambda source_id: source_labels[source_id],
+                key="web_source_for_questions"
+            )
+            web_question_count = st.number_input(
+                "Questions from this source",
+                min_value=1,
+                max_value=8,
+                value=5,
+                key="web_question_count"
+            )
+            if st.button(
+                "Generate and save source-grounded questions",
+                key="generate_web_questions"
+            ):
+                try:
+                    with st.spinner("Generating questions with local Ollama..."):
+                        created_questions = generate_web_questions(
+                            selected_source_id,
+                            count=web_question_count
+                        )
+                    st.success(
+                        f"Saved {len(created_questions)} questions for offline use."
+                    )
+                except Exception as error:
+                    st.error(f"Could not generate questions: {error}")
+        else:
+            st.info("No web sources have been imported.")
+
+    with study_sections[3]:
+        st.subheader("Recent practice")
+        all_questions = get_question_bank()
+        due_questions = get_question_bank(due_only=True)
+        study_docs = get_study_documents()
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("PDFs", len(study_docs))
+        metric_columns[1].metric("Saved questions", len(all_questions))
+        metric_columns[2].metric("Questions due", len(due_questions))
+        history = get_practice_history(limit=30)
+        if not history:
+            st.info("Submitted answers and review progress will appear here.")
+        else:
+            scores = [item["score"] for item in history if item["score"] is not None]
+            if scores:
+                st.metric("Average recent score", f"{sum(scores) / len(scores):.1f}/100")
+            topic_scores = {}
+            for item in history:
+                if item["score"] is not None:
+                    topic_scores.setdefault(item["topic"], []).append(item["score"])
+            weakest_topics = sorted(
+                topic_scores.items(),
+                key=lambda entry: sum(entry[1]) / len(entry[1])
+            )[:3]
+            if weakest_topics:
+                st.markdown("**Topics to revisit**")
+                for topic, topic_history in weakest_topics:
+                    average = sum(topic_history) / len(topic_history)
+                    st.write(f"- {topic}: {average:.0f}/100 average")
+            for attempt in history:
+                with st.expander(
+                    f"{attempt['created_at']} · {attempt['score']}/100 · "
+                    f"{attempt['topic']}"
+                ):
+                    st.markdown(f"**Question:** {attempt['question']}")
+                    st.markdown(f"**Your answer:** {attempt['answer']}")
+                    st.write(attempt["feedback"].get("feedback", ""))
+                    citations = [
+                        item["citation"] for item in attempt["source_evidence"]
+                    ]
+                    if citations:
+                        st.caption("Evidence: " + "; ".join(citations))

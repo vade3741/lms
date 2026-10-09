@@ -1,4 +1,12 @@
-import fitz
+import pymupdf
+
+
+def extract_pdf_pages(pdf_path):
+    try:
+        with pymupdf.open(pdf_path) as document:
+            return [page.get_text().strip() for page in document]
+    except Exception as error:
+        raise RuntimeError(f"Could not read PDF '{pdf_path}': {error}") from error
 
 
 def extract_text_from_pdf(uploaded_file):
@@ -6,7 +14,7 @@ def extract_text_from_pdf(uploaded_file):
 
     try:
         pdf_bytes = uploaded_file.read()
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
 
         for page in document:
             text += page.get_text()
